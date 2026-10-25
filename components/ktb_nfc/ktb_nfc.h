@@ -47,12 +47,15 @@ class KtbNfc : public PollingComponent,
   void rf_off_();
 
   // Logik
+  bool init_pn532_();
   void handle_list_response_(const std::vector<uint8_t> &p);
   bool apdu_(uint8_t tg, const std::vector<uint8_t> &apdu, std::vector<uint8_t> &resp);
   bool authenticate_(uint8_t tg);
 
   uint8_t key_[32]{};
   bool key_valid_{false};
+  bool pn_ready_{false};
+  uint32_t next_init_{0};
   State state_{State::IDLE};
   uint32_t state_ts_{0};
   uint32_t cooldown_until_{0};

@@ -15,11 +15,13 @@ static const uint8_t CMD_IN_LIST_PASSIVE = 0x4A;
 static const uint8_t CMD_IN_DATA_EXCHANGE = 0x40;
 
 static const uint32_t COOLDOWN_PHONE_MS = 3000;
+static const uint32_t CS_SETUP_MS = 2;          // PN532 braucht CS >= 2 ms low vor dem ersten SPI-Byte
+static const uint32_t INIT_RETRY_MS = 5000;
 
 // ------------------------------------------------------------------ SPI-Ebene
 void KtbNfc::write_frame_(const std::vector<uint8_t> &frame, uint32_t wake_ms) {
   this->enable();
-  if (wake_ms > 0) delay(wake_ms);  // CS lange genug low halten, um den PN532 zu wecken
+  delay(wake_ms > 0 ? wake_ms : CS_SETUP_MS);  // CS vor dem ersten Byte low halten (beim Wecken: laenger)
   this->write_byte(0x01);           // PN532-SPI: "Data write"
   this->write_array(frame.data(), frame.size());
   this->disable();
@@ -27,6 +29,7 @@ void KtbNfc::write_frame_(const std::vector<uint8_t> &frame, uint32_t wake_ms) {
 
 void KtbNfc::read_raw_(uint8_t *buf, size_t len) {
   this->enable();
+  delay(CS_SETUP_MS);
   this->write_byte(0x03);  // PN532-SPI: "Data read"
   this->read_array(buf, len);
   this->disable();
@@ -34,6 +37,7 @@ void KtbNfc::read_raw_(uint8_t *buf, size_t len) {
 
 bool KtbNfc::is_ready_() {
   this->enable();
+  delay(CS_SETUP_MS);
   this->write_byte(0x02);  // PN532-SPI: "Status read"
   uint8_t s = this->read_byte();
   this->disable();
@@ -99,6 +103,29 @@ void KtbNfc::rf_off_() {
 // ------------------------------------------------------------------ Component
 void KtbNfc::set_key_hex(const std::string &hex) { this->key_valid_ = ktb::parse_hex(hex, this->key_, 32); }
 
+bool KtbNfc::init_pn532_() {
+  // PN532 aus dem Power-Down wecken: CS >= 10 ms low, dann Dummy-Befehl. ACK und Antwort werden verworfen.
+  this->write_frame_(ktb::build_frame({CMD_GET_FIRMWARE}), 10);
+  delay(30);
+  uint8_t drain[64];
+  for (int i = 0; i < 2 && this->is_ready_(); i++) this->read_raw_(drain, sizeof(drain));
+  delay(10);
+
+  std::vector<uint8_t> p;
+  if (!this->exec_({CMD_GET_FIRMWARE}, 0x03, p, 200) || p.size() < 4) return false;
+  ESP_LOGI(TAG, "PN532 gefunden: IC=0x%02X Firmware %u.%u", (unsigned) p[0], (unsigned) p[1], (unsigned) p[2]);
+
+  // SAM: Normal mode, Timeout 0x14, IRQ aus Statusbyte
+  if (!this->exec_({CMD_SAM_CONFIG, 0x01, 0x14, 0x01}, 0x15, p, 200)) {
+    ESP_LOGW(TAG, "SAMConfiguration fehlgeschlagen");
+    return false;
+  }
+  // Wenige Aktivierungsversuche, damit InListPassiveTarget ohne Tag schnell zurueckkehrt
+  this->exec_({CMD_RF_CONFIG, 0x05, 0xFF, 0x01, 0x03}, 0x33, p, 100);
+  ESP_LOGI(TAG, "PN532 bereit - warte auf Tags / Handy");
+  return true;
+}
+
 void KtbNfc::setup() {
   this->spi_setup();
   if (!this->key_valid_) {
@@ -106,38 +133,30 @@ void KtbNfc::setup() {
     this->mark_failed();
     return;
   }
-
-  // PN532 aus dem Power-Down wecken: CS >= 10 ms low, dann Dummy-Befehl. Antwort wird verworfen.
-  this->write_frame_(ktb::build_frame({CMD_GET_FIRMWARE}), 10);
-  delay(30);
-  uint8_t drain[64];
-  for (int i = 0; i < 2 && this->is_ready_(); i++) this->read_raw_(drain, sizeof(drain));  // ACK + Antwort verwerfen
-  delay(10);
-
-  std::vector<uint8_t> p;
-  if (!this->exec_({CMD_GET_FIRMWARE}, 0x03, p, 200) || p.size() < 4) {
-    ESP_LOGE(TAG, "PN532 antwortet nicht (Verkabelung / SPI-Pins pruefen)");
-    this->mark_failed();
-    return;
+  this->pn_ready_ = this->init_pn532_();
+  if (!this->pn_ready_) {
+    ESP_LOGW(TAG, "PN532 antwortet noch nicht - neuer Versuch alle %u s", (unsigned) (INIT_RETRY_MS / 1000));
+    this->next_init_ = millis() + INIT_RETRY_MS;
   }
-  ESP_LOGI(TAG, "PN532 gefunden: IC=0x%02X Firmware %u.%u", (unsigned) p[0], (unsigned) p[1], (unsigned) p[2]);
-
-  // SAM: Normal mode, Timeout 0x14, IRQ aus Statusbyte
-  if (!this->exec_({CMD_SAM_CONFIG, 0x01, 0x14, 0x01}, 0x15, p, 200)) {
-    ESP_LOGE(TAG, "SAMConfiguration fehlgeschlagen");
-    this->mark_failed();
-    return;
-  }
-  // Wenige Aktivierungsversuche, damit InListPassiveTarget ohne Tag schnell zurueckkehrt
-  this->exec_({CMD_RF_CONFIG, 0x05, 0xFF, 0x01, 0x03}, 0x33, p, 100);
 }
 
 void KtbNfc::dump_config() {
   ESP_LOGCONFIG(TAG, "KTB NFC Key Reader (PN532 per SPI, APDU/HMAC-Challenge)");
+  ESP_LOGCONFIG(TAG, "  PN532 bereit: %s", this->pn_ready_ ? "ja" : "nein");
   LOG_UPDATE_INTERVAL(this);
 }
 
 void KtbNfc::update() {
+  if (!this->pn_ready_) {
+    if ((int32_t) (millis() - this->next_init_) < 0) return;
+    this->pn_ready_ = this->init_pn532_();
+    if (!this->pn_ready_) {
+      ESP_LOGW(TAG, "PN532 antwortet nicht (Verkabelung / SPI-Pins / Stromversorgung pruefen) - naechster Versuch in %u s",
+               (unsigned) (INIT_RETRY_MS / 1000));
+      this->next_init_ = millis() + INIT_RETRY_MS;
+    }
+    return;
+  }
   if (this->state_ != State::IDLE) return;
   if ((int32_t)(millis() - this->cooldown_until_) < 0) return;
   // 1 Ziel, 106 kbps Typ A
@@ -147,7 +166,7 @@ void KtbNfc::update() {
 }
 
 void KtbNfc::loop() {
-  if (this->state_ != State::WAIT_LIST) return;
+  if (!this->pn_ready_ || this->state_ != State::WAIT_LIST) return;
   if (this->is_ready_()) {
     this->state_ = State::IDLE;
     std::vector<uint8_t> p;
