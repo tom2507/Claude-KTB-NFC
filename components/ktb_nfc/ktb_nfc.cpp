@@ -138,8 +138,9 @@ bool KtbNfc::init_pn532_() {
     ESP_LOGW(TAG, "SAMConfiguration fehlgeschlagen");
     return false;
   }
-  // Wenige Aktivierungsversuche, damit InListPassiveTarget ohne Tag schnell zurueckkehrt
-  this->exec_({CMD_RF_CONFIG, 0x05, 0xFF, 0x01, 0x03}, 0x33, p, 100);
+  // Revision 4: 16 statt 3 passive Aktivierungsversuche (einziger Funktionstest).
+  // RF-Zustand, HMAC, APDUs und alle Timeouts bleiben unveraendert.
+  this->exec_({CMD_RF_CONFIG, 0x05, 0xFF, 0x01, 0x10}, 0x33, p, 100);
   ESP_LOGI(TAG, "PN532 bereit - warte auf Tags / Handy");
   return true;
 }
