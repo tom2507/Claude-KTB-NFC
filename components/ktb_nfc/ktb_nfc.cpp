@@ -249,6 +249,15 @@ void KtbNfc::handle_list_response_(const std::vector<uint8_t> &p) {
     // ISO-DEP (ISO 14443-4): z.B. Android-Handy im HCE-Modus -> Schluessel pruefen
     ESP_LOGD(TAG, "ISO-DEP Geraet (UID %s, SAK 0x%02X) - starte Challenge", uid.c_str(), (unsigned) sak);
     AuthResult result = this->authenticate_(tg);
+    // Revision 5: Nach jedem ISO-DEP-Versuch das aktivierte Ziel sauber freigeben.
+    // NXP PN532: InRelease (0x52), Antwort InRelease (0x53).
+    // Ein fehlgeschlagenes Release darf niemals eine Freigabe ausloesen.
+    std::vector<uint8_t> release_response;
+    if (!this->exec_({0x52, tg}, 0x53, release_response, 200) ||
+        release_response.empty() || (release_response[0] & 0x3F) != 0x00) {
+      ESP_LOGW(TAG, "ISO-DEP InRelease fehlgeschlagen (Status 0x%02X)",
+               (unsigned) (release_response.empty() ? 0xFF : release_response[0]));
+    }
     this->cooldown_until_ = millis() + COOLDOWN_PHONE_MS;
     // Revision 2 A/B-Test: HF-Feld nach Handy-Authentifizierung nicht explizit abschalten.
     // InListPassiveTarget startet nach dem Cooldown die naechste Suche.
