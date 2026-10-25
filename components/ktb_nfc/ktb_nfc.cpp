@@ -138,8 +138,20 @@ bool KtbNfc::init_pn532_() {
     ESP_LOGW(TAG, "SAMConfiguration fehlgeschlagen");
     return false;
   }
-  // Revision 4: 16 statt 3 passive Aktivierungsversuche (einziger Funktionstest).
-  // RF-Zustand, HMAC, APDUs und alle Timeouts bleiben unveraendert.
+  // Revision 7: PN532 RFConfiguration CfgItem 0x02 (Various timings).
+  // RFU=0x00, ATR_RES timeout=0x0B (102.4 ms, unveraendert),
+  // fRetryTimeout=0x0C (204.8 ms statt Default 0x0A = 51.2 ms).
+  // NXP UM0701-02: Wirkung von fRetryTimeout bei InDataExchange ist
+  // ausdruecklich fuer FeliCa/MIFARE dokumentiert; Android ISO-DEP
+  // ist damit NICHT als behoben nachgewiesen.
+  p.clear();
+  if (!this->exec_({CMD_RF_CONFIG, 0x02, 0x00, 0x0B, 0x0C}, 0x33, p, 100)) {
+    ESP_LOGW(TAG, "PN532 RF-Timing-Konfiguration fehlgeschlagen");
+    return false;
+  }
+  ESP_LOGI(TAG, "PN532 RF-Timing gesetzt: fRetryTimeout=204.8 ms (0x0C)");
+  // Passive Aktivierung: wie in Revision 5 (16 Versuche).
+  // HMAC, APDUs und Host-Timeouts bleiben unveraendert.
   this->exec_({CMD_RF_CONFIG, 0x05, 0xFF, 0x01, 0x10}, 0x33, p, 100);
   ESP_LOGI(TAG, "PN532 bereit - warte auf Tags / Handy");
   return true;
@@ -258,15 +270,9 @@ void KtbNfc::handle_list_response_(const std::vector<uint8_t> &p) {
       ESP_LOGW(TAG, "ISO-DEP InRelease fehlgeschlagen (Status 0x%02X)",
                (unsigned) (release_response.empty() ? 0xFF : release_response[0]));
     }
-    // Revision 6: Nur nach fehlgeschlagener Handy-Kommunikation das RF-Feld
-    // definiert ausschalten. Erfolgreiche Sitzungen bleiben wie in Revision 5.
-    // Die naechste InListPassiveTarget-Suche aktiviert das Feld erneut.
-    if (result == AuthResult::COMM_ERROR) {
-      ESP_LOGD(TAG, "ISO-DEP Fehler: RF-Feld zur Wiederherstellung ausschalten");
-      this->rf_off_();
-    }
     this->cooldown_until_ = millis() + COOLDOWN_PHONE_MS;
-    // Revision 2/5: Nach erfolgreicher Handy-Authentifizierung RF nicht abschalten.
+    // Revision 2 A/B-Test: HF-Feld nach Handy-Authentifizierung nicht explizit abschalten.
+    // InListPassiveTarget startet nach dem Cooldown die naechste Suche.
     if (result == AuthResult::OK) {
       this->key_ok_cb_.call();
     } else if (result == AuthResult::BAD_KEY) {
