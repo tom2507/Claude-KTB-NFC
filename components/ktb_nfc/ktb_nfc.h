@@ -50,7 +50,8 @@ class KtbNfc : public PollingComponent,
   bool init_pn532_();
   void handle_list_response_(const std::vector<uint8_t> &p);
   bool apdu_(uint8_t tg, const std::vector<uint8_t> &apdu, std::vector<uint8_t> &resp);
-  bool authenticate_(uint8_t tg);
+  enum class AuthResult : uint8_t { OK, BAD_KEY, COMM_ERROR };
+  AuthResult authenticate_(uint8_t tg);
 
   uint8_t key_[32]{};
   bool key_valid_{false};

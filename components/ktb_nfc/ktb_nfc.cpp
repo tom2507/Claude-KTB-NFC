@@ -208,13 +208,17 @@ void KtbNfc::handle_list_response_(const std::vector<uint8_t> &p) {
   if (sak & 0x20) {
     // ISO-DEP (ISO 14443-4): z.B. Android-Handy im HCE-Modus -> Schluessel pruefen
     ESP_LOGD(TAG, "ISO-DEP Geraet (UID %s, SAK 0x%02X) - starte Challenge", uid.c_str(), (unsigned) sak);
-    bool ok = this->authenticate_(tg);
+    AuthResult result = this->authenticate_(tg);
     this->cooldown_until_ = millis() + COOLDOWN_PHONE_MS;
     this->rf_off_();
-    if (ok) {
+    if (result == AuthResult::OK) {
       this->key_ok_cb_.call();
-    } else {
+    } else if (result == AuthResult::BAD_KEY) {
       this->key_fail_cb_.call();
+    } else {
+      // Kommunikationsfehler ist KEIN falscher Schluessel.
+      // Keine Freigabe und kein on_key_fail; naechster Scan startet eine neue Sitzung.
+      ESP_LOGW(TAG, "NFC-Kommunikationsfehler - neuer Versuch nach Cooldown");
     }
     return;
   }
@@ -241,16 +245,16 @@ bool KtbNfc::apdu_(uint8_t tg, const std::vector<uint8_t> &apdu, std::vector<uin
   return true;
 }
 
-bool KtbNfc::authenticate_(uint8_t tg) {
+KtbNfc::AuthResult KtbNfc::authenticate_(uint8_t tg) {
   std::vector<uint8_t> resp;
 
   if (!this->apdu_(tg, ktb::select_apdu(), resp)) {
     ESP_LOGW(TAG, "SELECT fehlgeschlagen - App installiert / Display an?");
-    return false;
+    return AuthResult::COMM_ERROR;
   }
   if (resp.size() != 2 || resp[0] != 0x90 || resp[1] != 0x00) {
     ESP_LOGW(TAG, "SELECT abgelehnt: %s", ktb::hex_str(resp.data(), resp.size(), ' ').c_str());
-    return false;
+    return AuthResult::COMM_ERROR;
   }
 
   uint8_t ch[16];
@@ -261,11 +265,11 @@ bool KtbNfc::authenticate_(uint8_t tg) {
 
   if (!this->apdu_(tg, ktb::challenge_apdu(ch), resp)) {
     ESP_LOGW(TAG, "Challenge fehlgeschlagen");
-    return false;
+    return AuthResult::COMM_ERROR;
   }
   if (resp.size() != 34 || resp[32] != 0x90 || resp[33] != 0x00) {
     ESP_LOGW(TAG, "Challenge-Antwort ungueltig: %s", ktb::hex_str(resp.data(), resp.size(), ' ').c_str());
-    return false;
+    return AuthResult::COMM_ERROR;
   }
 
   uint8_t expected[32];
@@ -276,7 +280,7 @@ bool KtbNfc::authenticate_(uint8_t tg) {
   } else {
     ESP_LOGW(TAG, "Schluessel FALSCH (HMAC stimmt nicht)");
   }
-  return ok;
+  return ok ? AuthResult::OK : AuthResult::BAD_KEY;
 }
 
 }  // namespace ktb_nfc
