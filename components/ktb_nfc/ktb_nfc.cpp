@@ -258,9 +258,15 @@ void KtbNfc::handle_list_response_(const std::vector<uint8_t> &p) {
       ESP_LOGW(TAG, "ISO-DEP InRelease fehlgeschlagen (Status 0x%02X)",
                (unsigned) (release_response.empty() ? 0xFF : release_response[0]));
     }
+    // Revision 6: Nur nach fehlgeschlagener Handy-Kommunikation das RF-Feld
+    // definiert ausschalten. Erfolgreiche Sitzungen bleiben wie in Revision 5.
+    // Die naechste InListPassiveTarget-Suche aktiviert das Feld erneut.
+    if (result == AuthResult::COMM_ERROR) {
+      ESP_LOGD(TAG, "ISO-DEP Fehler: RF-Feld zur Wiederherstellung ausschalten");
+      this->rf_off_();
+    }
     this->cooldown_until_ = millis() + COOLDOWN_PHONE_MS;
-    // Revision 2 A/B-Test: HF-Feld nach Handy-Authentifizierung nicht explizit abschalten.
-    // InListPassiveTarget startet nach dem Cooldown die naechste Suche.
+    // Revision 2/5: Nach erfolgreicher Handy-Authentifizierung RF nicht abschalten.
     if (result == AuthResult::OK) {
       this->key_ok_cb_.call();
     } else if (result == AuthResult::BAD_KEY) {
