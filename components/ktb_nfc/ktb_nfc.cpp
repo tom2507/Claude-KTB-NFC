@@ -210,7 +210,8 @@ void KtbNfc::handle_list_response_(const std::vector<uint8_t> &p) {
     ESP_LOGD(TAG, "ISO-DEP Geraet (UID %s, SAK 0x%02X) - starte Challenge", uid.c_str(), (unsigned) sak);
     AuthResult result = this->authenticate_(tg);
     this->cooldown_until_ = millis() + COOLDOWN_PHONE_MS;
-    this->rf_off_();
+    // Revision 2 A/B-Test: HF-Feld nach Handy-Authentifizierung nicht explizit abschalten.
+    // InListPassiveTarget startet nach dem Cooldown die naechste Suche.
     if (result == AuthResult::OK) {
       this->key_ok_cb_.call();
     } else if (result == AuthResult::BAD_KEY) {
