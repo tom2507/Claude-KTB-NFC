@@ -17,6 +17,13 @@ static const uint8_t CMD_IN_DATA_EXCHANGE = 0x40;
 static const uint32_t COOLDOWN_PHONE_MS = 3000;
 static const uint32_t CS_SETUP_MS = 2;          // PN532 braucht CS >= 2 ms low vor dem ersten SPI-Byte
 static const uint32_t INIT_RETRY_MS = 5000;
+// Revision 3: Nur Diagnose, keine Aenderung der NFC-Kommandos oder Zeitlimits.
+// Diese Zaehler gelten fuer die eine KTB-NFC-Teststation.
+static uint32_t diag_scans = 0;
+static uint32_t diag_empty = 0;
+static uint32_t diag_targets = 0;
+static uint32_t diag_scan_errors = 0;
+static uint32_t diag_last_summary = 0;
 
 // ------------------------------------------------------------------ SPI-Ebene
 void KtbNfc::write_frame_(const std::vector<uint8_t> &frame, uint32_t wake_ms) {
@@ -81,12 +88,23 @@ bool KtbNfc::recv_response_(uint8_t resp_code, std::vector<uint8_t> &payload) {
 
 bool KtbNfc::exec_(const std::vector<uint8_t> &cmd, uint8_t resp_code, std::vector<uint8_t> &payload,
                    uint32_t timeout_ms) {
-  if (!this->send_command_(cmd)) return false;
-  if (!this->wait_ready_(timeout_ms)) {
-    ESP_LOGW(TAG, "Timeout auf Antwort (Befehl 0x%02X)", (unsigned) cmd[0]);
+  uint32_t diag_start = millis();
+  if (!this->send_command_(cmd)) {
+    ESP_LOGW(TAG, "DIAG exec cmd=0x%02X ACK fehlgeschlagen nach %u ms", (unsigned) cmd[0],
+             (unsigned) (millis() - diag_start));
     return false;
   }
-  return this->recv_response_(resp_code, payload);
+  if (!this->wait_ready_(timeout_ms)) {
+    ESP_LOGW(TAG, "Timeout auf Antwort (Befehl 0x%02X)", (unsigned) cmd[0]);
+    ESP_LOGW(TAG, "DIAG exec cmd=0x%02X Antwort-Timeout nach %u ms", (unsigned) cmd[0],
+             (unsigned) (millis() - diag_start));
+    return false;
+  }
+  bool diag_ok = this->recv_response_(resp_code, payload);
+  if (cmd[0] == CMD_IN_DATA_EXCHANGE || !diag_ok)
+    ESP_LOGD(TAG, "DIAG exec cmd=0x%02X ok=%u dauer=%u ms payload=%u B", (unsigned) cmd[0],
+             (unsigned) diag_ok, (unsigned) (millis() - diag_start), (unsigned) payload.size());
+  return diag_ok;
 }
 
 void KtbNfc::abort_command_() {
@@ -159,8 +177,20 @@ void KtbNfc::update() {
   }
   if (this->state_ != State::IDLE) return;
   if ((int32_t)(millis() - this->cooldown_until_) < 0) return;
+  if (millis() - diag_last_summary >= 10000) {
+    ESP_LOGI(TAG, "DIAG 10s+ scans=%u leer=%u ziele=%u scanfehler=%u status=%s",
+             (unsigned) diag_scans, (unsigned) diag_empty, (unsigned) diag_targets,
+             (unsigned) diag_scan_errors, this->pn_ready_ ? "bereit" : "nicht bereit");
+    diag_scans = diag_empty = diag_targets = diag_scan_errors = 0;
+    diag_last_summary = millis();
+  }
   // 1 Ziel, 106 kbps Typ A
-  if (!this->send_command_({CMD_IN_LIST_PASSIVE, 0x01, 0x00})) return;
+  ++diag_scans;
+  if (!this->send_command_({CMD_IN_LIST_PASSIVE, 0x01, 0x00})) {
+    ++diag_scan_errors;
+    ESP_LOGW(TAG, "DIAG Scan-Befehl fehlgeschlagen");
+    return;
+  }
   this->state_ = State::WAIT_LIST;
   this->state_ts_ = millis();
 }
@@ -171,12 +201,21 @@ void KtbNfc::loop() {
     this->state_ = State::IDLE;
     std::vector<uint8_t> p;
     if (!this->recv_response_(0x4B, p)) {
+      ++diag_scan_errors;
+      ESP_LOGW(TAG, "DIAG Scan-Antwort ungueltig nach %u ms", (unsigned) (millis() - this->state_ts_));
       this->rf_off_();
       return;
     }
+    if (p.empty() || p[0] == 0) ++diag_empty;
+    else ++diag_targets;
+    if (!p.empty() && p[0] != 0)
+      ESP_LOGD(TAG, "DIAG Ziel gefunden nach %u ms, Antwort=%u B", (unsigned) (millis() - this->state_ts_),
+               (unsigned) p.size());
     this->handle_list_response_(p);
   } else if (millis() - this->state_ts_ > 1500) {
+    ++diag_scan_errors;
     ESP_LOGW(TAG, "InListPassiveTarget Timeout - breche ab");
+    ESP_LOGW(TAG, "DIAG Scan-Timeout nach %u ms", (unsigned) (millis() - this->state_ts_));
     this->abort_command_();
     this->rf_off_();
     this->state_ = State::IDLE;
@@ -237,7 +276,15 @@ bool KtbNfc::apdu_(uint8_t tg, const std::vector<uint8_t> &apdu, std::vector<uin
   std::vector<uint8_t> cmd = {CMD_IN_DATA_EXCHANGE, tg};
   cmd.insert(cmd.end(), apdu.begin(), apdu.end());
   std::vector<uint8_t> p;
-  if (!this->exec_(cmd, 0x41, p, 400)) return false;
+  uint32_t diag_start = millis();
+  if (!this->exec_(cmd, 0x41, p, 400)) {
+    ESP_LOGW(TAG, "DIAG APDU INS=0x%02X Transportfehler nach %u ms", (unsigned) (apdu.size() > 1 ? apdu[1] : 0),
+             (unsigned) (millis() - diag_start));
+    return false;
+  }
+  ESP_LOGD(TAG, "DIAG APDU INS=0x%02X dauer=%u ms PN532-status=0x%02X antwort=%u B",
+           (unsigned) (apdu.size() > 1 ? apdu[1] : 0), (unsigned) (millis() - diag_start),
+           (unsigned) (p.empty() ? 0xFF : p[0]), (unsigned) (p.empty() ? 0 : p.size() - 1));
   if (p.empty() || (p[0] & 0x3F) != 0x00) {
     ESP_LOGW(TAG, "InDataExchange Status 0x%02X", (unsigned) (p.empty() ? 0xFF : p[0]));
     return false;
