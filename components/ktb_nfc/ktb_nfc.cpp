@@ -17,13 +17,19 @@ static const uint8_t CMD_IN_DATA_EXCHANGE = 0x40;
 static const uint32_t COOLDOWN_PHONE_MS = 3000;
 static const uint32_t CS_SETUP_MS = 2;          // PN532 braucht CS >= 2 ms low vor dem ersten SPI-Byte
 static const uint32_t INIT_RETRY_MS = 5000;
-// Revision 3: Nur Diagnose, keine Aenderung der NFC-Kommandos oder Zeitlimits.
+// Revision 8 basiert auf Revision 5: erweiterte ISO-DEP- und Release-Diagnose.
+// Keine Aenderung der NFC-Kommandos, RF-Konfiguration oder Zeitlimits.
 // Diese Zaehler gelten fuer die eine KTB-NFC-Teststation.
 static uint32_t diag_scans = 0;
 static uint32_t diag_empty = 0;
 static uint32_t diag_targets = 0;
 static uint32_t diag_scan_errors = 0;
 static uint32_t diag_last_summary = 0;
+static uint32_t diag_phone_sessions = 0;
+static uint32_t diag_phone_ok = 0;
+static uint32_t diag_phone_bad_key = 0;
+static uint32_t diag_phone_comm_error = 0;
+static uint32_t diag_release_fail = 0;
 
 // ------------------------------------------------------------------ SPI-Ebene
 void KtbNfc::write_frame_(const std::vector<uint8_t> &frame, uint32_t wake_ms) {
@@ -138,20 +144,8 @@ bool KtbNfc::init_pn532_() {
     ESP_LOGW(TAG, "SAMConfiguration fehlgeschlagen");
     return false;
   }
-  // Revision 7: PN532 RFConfiguration CfgItem 0x02 (Various timings).
-  // RFU=0x00, ATR_RES timeout=0x0B (102.4 ms, unveraendert),
-  // fRetryTimeout=0x0C (204.8 ms statt Default 0x0A = 51.2 ms).
-  // NXP UM0701-02: Wirkung von fRetryTimeout bei InDataExchange ist
-  // ausdruecklich fuer FeliCa/MIFARE dokumentiert; Android ISO-DEP
-  // ist damit NICHT als behoben nachgewiesen.
-  p.clear();
-  if (!this->exec_({CMD_RF_CONFIG, 0x02, 0x00, 0x0B, 0x0C}, 0x33, p, 100)) {
-    ESP_LOGW(TAG, "PN532 RF-Timing-Konfiguration fehlgeschlagen");
-    return false;
-  }
-  ESP_LOGI(TAG, "PN532 RF-Timing gesetzt: fRetryTimeout=204.8 ms (0x0C)");
-  // Passive Aktivierung: wie in Revision 5 (16 Versuche).
-  // HMAC, APDUs und Host-Timeouts bleiben unveraendert.
+  // Revision 4: 16 statt 3 passive Aktivierungsversuche (einziger Funktionstest).
+  // RF-Zustand, HMAC, APDUs und alle Timeouts bleiben unveraendert.
   this->exec_({CMD_RF_CONFIG, 0x05, 0xFF, 0x01, 0x10}, 0x33, p, 100);
   ESP_LOGI(TAG, "PN532 bereit - warte auf Tags / Handy");
   return true;
@@ -195,6 +189,9 @@ void KtbNfc::update() {
              (unsigned) diag_scans, (unsigned) diag_empty, (unsigned) diag_targets,
              (unsigned) diag_scan_errors, this->pn_ready_ ? "bereit" : "nicht bereit");
     diag_scans = diag_empty = diag_targets = diag_scan_errors = 0;
+    ESP_LOGI(TAG, "DIAG HCE gesamt: sitzungen=%u ok=%u schluessel_falsch=%u kommunikationsfehler=%u release_fehler=%u",
+             (unsigned) diag_phone_sessions, (unsigned) diag_phone_ok, (unsigned) diag_phone_bad_key,
+             (unsigned) diag_phone_comm_error, (unsigned) diag_release_fail);
     diag_last_summary = millis();
   }
   // 1 Ziel, 106 kbps Typ A
@@ -260,28 +257,44 @@ void KtbNfc::handle_list_response_(const std::vector<uint8_t> &p) {
   if (sak & 0x20) {
     // ISO-DEP (ISO 14443-4): z.B. Android-Handy im HCE-Modus -> Schluessel pruefen
     ESP_LOGD(TAG, "ISO-DEP Geraet (UID %s, SAK 0x%02X) - starte Challenge", uid.c_str(), (unsigned) sak);
+    ++diag_phone_sessions;
+    const uint32_t session_id = diag_phone_sessions;
+    const uint32_t session_start = millis();
+    ESP_LOGI(TAG, "HCE #%u START tg=%u uid=%s antwort=%u B",
+             (unsigned) session_id, (unsigned) tg, uid.c_str(), (unsigned) p.size());
+    // Revision 5 hat InRelease bereits nach JEDEM ISO-DEP-Versuch ausgefuehrt,
+    // auch bei SELECT-/Challenge-Fehlern. Revision 8 behaelt dieses Verhalten bei.
     AuthResult result = this->authenticate_(tg);
-    // Revision 5: Nach jedem ISO-DEP-Versuch das aktivierte Ziel sauber freigeben.
-    // NXP PN532: InRelease (0x52), Antwort InRelease (0x53).
-    // Ein fehlgeschlagenes Release darf niemals eine Freigabe ausloesen.
+    const uint32_t auth_duration = millis() - session_start;
     std::vector<uint8_t> release_response;
-    if (!this->exec_({0x52, tg}, 0x53, release_response, 200) ||
-        release_response.empty() || (release_response[0] & 0x3F) != 0x00) {
-      ESP_LOGW(TAG, "ISO-DEP InRelease fehlgeschlagen (Status 0x%02X)",
-               (unsigned) (release_response.empty() ? 0xFF : release_response[0]));
+    const uint32_t release_start = millis();
+    const bool release_transport_ok = this->exec_({0x52, tg}, 0x53, release_response, 200);
+    const uint8_t release_status = release_response.empty() ? 0xFF : release_response[0];
+    const bool release_ok = release_transport_ok && !release_response.empty() &&
+                            (release_status & 0x3F) == 0x00;
+    ESP_LOGI(TAG, "HCE #%u RELEASE transport=%u status=0x%02X dauer=%u ms",
+             (unsigned) session_id, (unsigned) release_transport_ok,
+             (unsigned) release_status, (unsigned) (millis() - release_start));
+    if (!release_ok) {
+      ++diag_release_fail;
+      ESP_LOGW(TAG, "HCE #%u InRelease fehlgeschlagen", (unsigned) session_id);
     }
     this->cooldown_until_ = millis() + COOLDOWN_PHONE_MS;
-    // Revision 2 A/B-Test: HF-Feld nach Handy-Authentifizierung nicht explizit abschalten.
-    // InListPassiveTarget startet nach dem Cooldown die naechste Suche.
     if (result == AuthResult::OK) {
+      ++diag_phone_ok;
       this->key_ok_cb_.call();
     } else if (result == AuthResult::BAD_KEY) {
+      ++diag_phone_bad_key;
       this->key_fail_cb_.call();
     } else {
+      ++diag_phone_comm_error;
       // Kommunikationsfehler ist KEIN falscher Schluessel.
-      // Keine Freigabe und kein on_key_fail; naechster Scan startet eine neue Sitzung.
       ESP_LOGW(TAG, "NFC-Kommunikationsfehler - neuer Versuch nach Cooldown");
     }
+    ESP_LOGI(TAG, "HCE #%u ENDE auth=%s auth_dauer=%u ms gesamt=%u ms",
+             (unsigned) session_id,
+             result == AuthResult::OK ? "OK" : (result == AuthResult::BAD_KEY ? "BAD_KEY" : "COMM_ERROR"),
+             (unsigned) auth_duration, (unsigned) (millis() - session_start));
     return;
   }
 
